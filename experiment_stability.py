@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Callable
 from dataclasses import dataclass
 from tqdm import tqdm
 
@@ -134,7 +134,7 @@ class mHCBlock(nn.Module):
     """Transformer block with manifold-constrained Hyper-Connections."""
 
     def __init__(self, hidden_dim: int, num_heads: int, expansion_rate: int = 4,
-                 dropout: float = 0.1, max_seq_len: int = 512, sinkhorn_iters: int = 10):
+                 dropout: float = 0.1, max_seq_len: int = 512, sinkhorn_iters: int = 20):
         super().__init__()
         self.expansion_rate = expansion_rate
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -344,11 +344,9 @@ def get_wikitext2_data():
     Wikipedia Good and Featured articles. More diverse vocabulary
     and complex patterns than TinyShakespeare.
 
-    Source: https://huggingface.co/datasets/wikitext
+    Source: https://huggingface.co/datasets/Salesforce/wikitext
     """
-    import urllib.request
     import os
-    import zipfile
 
     cache_file = "data/wikitext2.txt"
     os.makedirs("data", exist_ok=True)
@@ -358,34 +356,32 @@ def get_wikitext2_data():
         with open(cache_file, 'r', encoding='utf-8') as f:
             return f.read()
 
-    url = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip"
-    zip_file = "data/wikitext-2-v1.zip"
-
-    print(f"Downloading WikiText-2 dataset...")
+    print("Downloading WikiText-2 dataset from Hugging Face...")
 
     try:
-        urllib.request.urlretrieve(url, zip_file)
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError(
+            "Please install the 'datasets' library: pip install datasets"
+        )
 
-        # Extract
-        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-            zip_ref.extractall("data")
+    # Load wikitext-2-raw-v1 (character-level compatible)
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")
 
-        # Read train file
-        train_file = "data/wikitext-2/wiki.train.tokens"
-        with open(train_file, 'r', encoding='utf-8') as f:
-            text = f.read()
+    # Combine all splits
+    all_text = []
+    for split in ["train", "validation", "test"]:
+        texts = dataset[split]["text"]
+        all_text.extend(texts)
 
-        # Cache combined
-        with open(cache_file, 'w', encoding='utf-8') as f:
-            f.write(text)
+    combined = "\n".join(all_text)
 
-        print(f"Downloaded WikiText-2: {len(text):,} characters")
-        return text
+    # Cache for future use
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        f.write(combined)
 
-    except Exception as e:
-        print(f"Failed to download WikiText-2: {e}")
-        print("Falling back to TinyShakespeare...")
-        return get_tinyshakespeare_data()
+    print(f"Downloaded WikiText-2: {len(combined):,} characters")
+    return combined
 
 
 def get_tinyshakespeare_data():
@@ -411,10 +407,148 @@ def get_tinyshakespeare_data():
         return "The quick brown fox jumps over the lazy dog. " * 10000
 
 
+def get_wikitext103_data():
+    """
+    Download and return WikiText-103 dataset.
+
+    WikiText-103 is a large-scale dataset (~500MB raw) with 100M+ tokens
+    extracted from Wikipedia Good and Featured articles.
+
+    Source: https://huggingface.co/datasets/Salesforce/wikitext
+    """
+    import os
+
+    cache_file = "data/wikitext103.txt"
+    os.makedirs("data", exist_ok=True)
+
+    if os.path.exists(cache_file):
+        print(f"Loading cached WikiText-103 from {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    print("Downloading WikiText-103 dataset from Hugging Face...")
+    print("This may take a few minutes (~500MB)...")
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise RuntimeError(
+            "Please install the 'datasets' library: pip install datasets"
+        )
+
+    # Load wikitext-103-raw-v1 (character-level compatible)
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1")
+
+    # Combine all splits
+    all_text = []
+    for split in ["train", "validation", "test"]:
+        texts = dataset[split]["text"]
+        all_text.extend(texts)
+
+    combined = "\n".join(all_text)
+
+    # Cache for future use
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        f.write(combined)
+
+    print(f"Downloaded WikiText-103: {len(combined):,} characters ({len(combined) / 1e6:.1f} MB)")
+    return combined
+
+
+def get_enwik8_data():
+    """
+    Download and return enwik8 dataset.
+
+    enwik8 is exactly 100MB of Wikipedia XML text, commonly used for
+    character-level language modeling benchmarks.
+
+    Source: https://mattmahoney.net/dc/textdata.html
+    """
+    import os
+    import urllib.request
+    import zipfile
+    import io
+
+    cache_file = "data/enwik8.txt"
+    os.makedirs("data", exist_ok=True)
+
+    if os.path.exists(cache_file):
+        print(f"Loading cached enwik8 from {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+
+    print("Downloading enwik8 dataset (100MB)...")
+    url = "http://mattmahoney.net/dc/enwik8.zip"
+
+    try:
+        with urllib.request.urlopen(url) as response:
+            zip_data = response.read()
+
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+            with z.open('enwik8') as f:
+                text = f.read().decode('utf-8', errors='ignore')
+
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        print(f"Downloaded enwik8: {len(text):,} characters ({len(text) / 1e6:.1f} MB)")
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Failed to download enwik8: {e}")
+
+
+def get_enwik9_data():
+    """
+    Download and return enwik9 dataset.
+
+    enwik9 is exactly 1GB of Wikipedia XML text, a larger version of enwik8.
+
+    Source: https://mattmahoney.net/dc/textdata.html
+    """
+    import os
+    import urllib.request
+    import zipfile
+    import io
+
+    cache_file = "data/enwik9.txt"
+    os.makedirs("data", exist_ok=True)
+
+    if os.path.exists(cache_file):
+        print(f"Loading cached enwik9 from {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+
+    print("Downloading enwik9 dataset (1GB)...")
+    print("This may take several minutes...")
+    url = "http://mattmahoney.net/dc/enwik9.zip"
+
+    try:
+        with urllib.request.urlopen(url) as response:
+            zip_data = response.read()
+
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+            with z.open('enwik9') as f:
+                text = f.read().decode('utf-8', errors='ignore')
+
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        print(f"Downloaded enwik9: {len(text):,} characters ({len(text) / 1e6:.1f} MB)")
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Failed to download enwik9: {e}")
+
+
 def get_training_data(dataset: str = "wikitext2"):
     """Get training data from specified dataset."""
     if dataset == "wikitext2":
         return get_wikitext2_data()
+    elif dataset == "wikitext103":
+        return get_wikitext103_data()
+    elif dataset == "enwik8":
+        return get_enwik8_data()
+    elif dataset == "enwik9":
+        return get_enwik9_data()
     else:
         return get_tinyshakespeare_data()
 
@@ -454,19 +588,58 @@ def compute_amax_gain(activations: List[torch.Tensor]) -> float:
 
 @dataclass
 class TrainConfig:
-    """Training configuration matching paper setup where possible."""
+    """Training configuration matching paper setup where possible.
+
+    Reference: arXiv:2512.24880 Section "Detailed Model Specifications and Hyper-parameters"
+
+    Paper settings (for 3B model):
+    - Optimizer: AdamW with betas (0.9, 0.95)
+    - Weight decay: 0.1
+    - Warmup steps: 2000 (scaled for smaller experiments)
+    - LR schedule: Step-based decay with ratios [0.316, 0.1]
+    - Expansion rate (n): 4
+    - Sinkhorn iterations: 20
+    """
     vocab_size: int = 50
-    hidden_dim: int = 256      # Increased for more challenging experiments
-    num_layers: int = 8        # Deeper network to show stability differences
+    hidden_dim: int = 256
+    num_layers: int = 8
     num_heads: int = 8
-    expansion_rate: int = 4    # Matches paper: n=4
+    expansion_rate: int = 4      # Paper: n=4
+    sinkhorn_iters: int = 20     # Paper: t_max=20 (was 10)
     max_seq_len: int = 128
     batch_size: int = 32
-    learning_rate: float = 3e-4  # Standard LM learning rate
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.1    # Paper: 0.1 (was 0.01)
+    betas: Tuple[float, float] = (0.9, 0.95)  # Paper: (0.9, 0.95)
+    warmup_ratio: float = 0.05   # ~5% warmup (paper uses ~4-7%)
+    lr_decay_ratio: float = 0.1  # Final LR = initial * 0.1
     max_iters: int = 1000
-    log_interval: int = 20     # More frequent logging
+    log_interval: int = 20
     dataset: str = "wikitext2"
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def get_lr_scheduler(optimizer, config: TrainConfig):
+    """
+    Create learning rate scheduler matching paper setup.
+
+    Paper uses step-based decay with ratios [0.316, 0.1].
+    We implement warmup + cosine decay for simplicity and comparable behavior.
+    """
+    warmup_steps = int(config.max_iters * config.warmup_ratio)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            # Linear warmup
+            return (step + 1) / warmup_steps
+        else:
+            # Cosine decay to lr_decay_ratio of initial LR
+            progress = (step - warmup_steps) / (config.max_iters - warmup_steps)
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+            # Decay from 1.0 to lr_decay_ratio
+            return config.lr_decay_ratio + (1 - config.lr_decay_ratio) * cosine_decay
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def train_model(
@@ -479,7 +652,13 @@ def train_model(
     """Train a model and collect metrics."""
 
     model = model.to(config.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+        betas=config.betas
+    )
+    scheduler = get_lr_scheduler(optimizer, config)
 
     metrics = {
         'loss': [],
@@ -527,6 +706,7 @@ def train_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         optimizer.step()
+        scheduler.step()
 
         # Compute Amax gain
         with torch.no_grad():
@@ -698,9 +878,10 @@ def run_experiment(config: Optional[TrainConfig] = None):
     print("Training Stability Experiment: Baseline vs HC vs mHC")
     print("=" * 60)
     print(f"Device: {config.device}")
-    print(f"Hidden dim: {config.hidden_dim}")
-    print(f"Num layers: {config.num_layers}")
-    print(f"Expansion rate: {config.expansion_rate}")
+    print(f"Hidden dim: {config.hidden_dim}, Num layers: {config.num_layers}")
+    print(f"Expansion rate: {config.expansion_rate}, Sinkhorn iters: {config.sinkhorn_iters}")
+    print(f"LR: {config.learning_rate}, Weight decay: {config.weight_decay}")
+    print(f"Betas: {config.betas}, Warmup: {config.warmup_ratio*100:.0f}%")
     print(f"Max iterations: {config.max_iters}")
     print("=" * 60)
 
@@ -755,7 +936,8 @@ def run_experiment(config: Optional[TrainConfig] = None):
         num_layers=config.num_layers,
         num_heads=config.num_heads,
         expansion_rate=config.expansion_rate,
-        max_seq_len=config.max_seq_len
+        max_seq_len=config.max_seq_len,
+        sinkhorn_iters=config.sinkhorn_iters
     )
     print(f"Parameters: {sum(p.numel() for p in mhc_model.parameters()):,}")
     results['mHC'] = train_model(mhc_model, train_loader, config, "mHC")
@@ -803,11 +985,16 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=8)
-    parser.add_argument("--expansion_rate", type=int, default=4)
+    parser.add_argument("--expansion_rate", type=int, default=4, help="mHC expansion rate (paper: n=4)")
+    parser.add_argument("--sinkhorn_iters", type=int, default=20, help="Sinkhorn-Knopp iterations (paper: 20)")
     parser.add_argument("--max_iters", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--dataset", type=str, default="wikitext2", choices=["wikitext2", "shakespeare"])
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay (paper: 0.1)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05, help="Warmup ratio (paper: ~5%%)")
+    parser.add_argument("--dataset", type=str, default="wikitext2",
+                        choices=["wikitext2", "wikitext103", "enwik8", "enwik9", "shakespeare"],
+                        help="Dataset: wikitext2 (~2MB), wikitext103 (~500MB), enwik8 (100MB), enwik9 (1GB), shakespeare (~1MB)")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
@@ -816,9 +1003,12 @@ if __name__ == "__main__":
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         expansion_rate=args.expansion_rate,
+        sinkhorn_iters=args.sinkhorn_iters,
         max_iters=args.max_iters,
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio
     )
 
     if args.device:

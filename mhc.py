@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 
 def sinkhorn_knopp(
     log_alpha: torch.Tensor,
-    num_iters: int = 10,
+    num_iters: int = 20,  # Paper: t_max = 20
     eps: float = 1e-8
 ) -> torch.Tensor:
     """
@@ -168,7 +168,7 @@ class mHC(nn.Module):
         self,
         expansion_rate: int = 4,
         hidden_dim: int = 512,
-        sinkhorn_iters: int = 10
+        sinkhorn_iters: int = 20  # Paper: t_max = 20
     ):
         super().__init__()
         self.n = expansion_rate
@@ -300,7 +300,7 @@ class mHCBlock(nn.Module):
         expansion_rate: int = 4,
         ffn_ratio: int = 4,
         dropout: float = 0.1,
-        sinkhorn_iters: int = 10
+        sinkhorn_iters: int = 20  # Paper: t_max = 20
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
