@@ -120,9 +120,8 @@ class HyperConnection(nn.Module):
         # (n, n) @ (B, S, n, d) -> contract on second-to-last dim
         x_pre = torch.einsum('ij,bsjd->bsid', self.H_pre, x)
 
-        # Compute weighted input for layer (sum across copies)
-        # Take first copy as layer input (or could use weighted sum)
-        layer_input = x_pre.sum(dim=2)  # (B, S, d)
+        # Compute weighted input for layer (mean across copies to prevent explosion)
+        layer_input = x_pre.mean(dim=2)  # (B, S, d)
 
         # Apply the layer function
         layer_output = layer_fn(layer_input)  # (B, S, d)
@@ -130,8 +129,8 @@ class HyperConnection(nn.Module):
         # Expand back to n copies
         layer_output = layer_output.unsqueeze(2).expand(-1, -1, n, -1)
 
-        # H_res * H_pre * x: residual path
-        x_res = torch.einsum('ij,bsjd->bsid', self.H_res, x_pre)
+        # H_res * x: residual path (apply to original x for proper residual)
+        x_res = torch.einsum('ij,bsjd->bsid', self.H_res, x)
 
         # Combine layer output with residual
         combined = layer_output + x_res
@@ -247,24 +246,29 @@ class mHC(nn.Module):
         # H_pre * x: mix copies before layer
         x_pre = torch.einsum('ij,bsjd->bsid', H_pre, x)
 
-        # Compute weighted input for layer (sum across copies, then normalize)
-        # The sum of H_pre rows gives the weighting
-        layer_input = x_pre.sum(dim=2)  # (B, S, d)
+        # Compute weighted input for layer (mean across copies to maintain magnitude)
+        # Using mean instead of sum prevents signal amplification
+        layer_input = x_pre.mean(dim=2)  # (B, S, d)
 
         # Apply the layer function
         layer_output = layer_fn(layer_input)  # (B, S, d)
 
-        # Expand back to n copies
+        # Expand back to n copies (each copy gets the layer output)
         layer_output = layer_output.unsqueeze(2).expand(-1, -1, n, -1)
 
-        # H_res * H_pre * x: residual path through doubly stochastic matrix
-        x_res = torch.einsum('ij,bsjd->bsid', H_res, x_pre)
+        # H_res * x: residual path through doubly stochastic matrix
+        # Apply H_res directly to original x for proper residual connection
+        x_res = torch.einsum('ij,bsjd->bsid', H_res, x)
 
         # Combine layer output with residual
         combined = layer_output + x_res
 
-        # H_post: mix after combination
+        # H_post: mix after combination, normalize by sum to bound output
         output = torch.einsum('ij,bsjd->bsid', H_post, combined)
+        # Normalize by row sums of H_post to prevent unbounded growth
+        # H_post.sum(dim=-1) gives (n,), need to reshape to (1, 1, n, 1) for broadcasting
+        h_post_row_sums = H_post.sum(dim=-1).view(1, 1, -1, 1)
+        output = output / (h_post_row_sums + 1e-8)
 
         return output
 
