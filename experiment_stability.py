@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Optional, Tuple, Dict, List, Callable
+from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass
 from tqdm import tqdm
 
@@ -32,24 +32,19 @@ from mhc import HyperConnection, mHC, expand_to_mhc, contract_from_mhc
 # =============================================================================
 
 class CausalSelfAttention(nn.Module):
-    """Causal self-attention module."""
+    """Causal self-attention using PyTorch's scaled_dot_product_attention."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1, max_seq_len: int = 512):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
         assert hidden_dim % num_heads == 0
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.dropout = dropout
 
         self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
         self.proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
-
-        self.register_buffer(
-            "causal_mask",
-            torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len)
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, D = x.shape
@@ -59,12 +54,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = attn.masked_fill(self.causal_mask[:, :, :S, :S] == 0, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-        out = torch.matmul(attn, v)
+        # Use SDPA with Flash Attention when available
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True
+        )
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         return self.proj_dropout(self.proj(out))
 
@@ -79,7 +75,9 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.fc2(self.dropout(F.gelu(self.fc1(x)))))
+        x = F.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return self.dropout(x)
 
 
 # -----------------------------------------------------------------------------
@@ -89,11 +87,11 @@ class FeedForward(nn.Module):
 class BaselineBlock(nn.Module):
     """Standard transformer block with residual connections."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1, max_seq_len: int = 512):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout, max_seq_len)
+        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout)
         self.ffn = FeedForward(hidden_dim, dropout=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -110,19 +108,25 @@ class HCBlock(nn.Module):
     """Transformer block with unconstrained Hyper-Connections."""
 
     def __init__(self, hidden_dim: int, num_heads: int, expansion_rate: int = 4,
-                 dropout: float = 0.1, max_seq_len: int = 512):
+                 dropout: float = 0.1):
         super().__init__()
         self.expansion_rate = expansion_rate
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout, max_seq_len)
+        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout)
         self.ffn = FeedForward(hidden_dim, dropout=dropout)
         self.hc_attn = HyperConnection(expansion_rate, hidden_dim)
         self.hc_ffn = HyperConnection(expansion_rate, hidden_dim)
 
+    def _attn_fn(self, h: torch.Tensor) -> torch.Tensor:
+        return self.attn(self.norm1(h))
+
+    def _ffn_fn(self, h: torch.Tensor) -> torch.Tensor:
+        return self.ffn(self.norm2(h))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.hc_attn(x, lambda h: self.attn(self.norm1(h)))
-        x = self.hc_ffn(x, lambda h: self.ffn(self.norm2(h)))
+        x = self.hc_attn(x, self._attn_fn)
+        x = self.hc_ffn(x, self._ffn_fn)
         return x
 
 
@@ -134,19 +138,25 @@ class mHCBlock(nn.Module):
     """Transformer block with manifold-constrained Hyper-Connections."""
 
     def __init__(self, hidden_dim: int, num_heads: int, expansion_rate: int = 4,
-                 dropout: float = 0.1, max_seq_len: int = 512, sinkhorn_iters: int = 20):
+                 dropout: float = 0.1, sinkhorn_iters: int = 20):
         super().__init__()
         self.expansion_rate = expansion_rate
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout, max_seq_len)
+        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout)
         self.ffn = FeedForward(hidden_dim, dropout=dropout)
         self.mhc_attn = mHC(expansion_rate, hidden_dim, sinkhorn_iters)
         self.mhc_ffn = mHC(expansion_rate, hidden_dim, sinkhorn_iters)
 
+    def _attn_fn(self, h: torch.Tensor) -> torch.Tensor:
+        return self.attn(self.norm1(h))
+
+    def _ffn_fn(self, h: torch.Tensor) -> torch.Tensor:
+        return self.ffn(self.norm2(h))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.mhc_attn(x, lambda h: self.attn(self.norm1(h)))
-        x = self.mhc_ffn(x, lambda h: self.ffn(self.norm2(h)))
+        x = self.mhc_attn(x, self._attn_fn)
+        x = self.mhc_ffn(x, self._ffn_fn)
         return x
 
 
@@ -164,13 +174,14 @@ class BaselineGPT(nn.Module):
         self.pos_emb = nn.Embedding(max_seq_len, hidden_dim)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            BaselineBlock(hidden_dim, num_heads, dropout, max_seq_len)
+            BaselineBlock(hidden_dim, num_heads, dropout)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight
         self.apply(self._init_weights)
+        # Weight tying (after init so embedding init is used)
+        self.lm_head.weight = self.tok_emb.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -180,7 +191,7 @@ class BaselineGPT(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor] = None):
         B, S = input_ids.shape
-        positions = torch.arange(0, S, device=input_ids.device)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(positions))
         for block in self.blocks:
             x = block(x)
@@ -191,11 +202,12 @@ class BaselineGPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    @torch.inference_mode()
     def get_activations(self, input_ids: torch.Tensor) -> List[torch.Tensor]:
         """Get activations at each layer for Amax gain computation."""
         activations = []
         B, S = input_ids.shape
-        positions = torch.arange(0, S, device=input_ids.device)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(positions))
         activations.append(x.detach())
         for block in self.blocks:
@@ -215,13 +227,14 @@ class HCGPT(nn.Module):
         self.pos_emb = nn.Embedding(max_seq_len, hidden_dim)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            HCBlock(hidden_dim, num_heads, expansion_rate, dropout, max_seq_len)
+            HCBlock(hidden_dim, num_heads, expansion_rate, dropout)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight
         self.apply(self._init_weights)
+        # Weight tying (after init so embedding init is used)
+        self.lm_head.weight = self.tok_emb.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -231,7 +244,7 @@ class HCGPT(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor] = None):
         B, S = input_ids.shape
-        positions = torch.arange(0, S, device=input_ids.device)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(positions))
         x = expand_to_mhc(x, self.expansion_rate)
         for block in self.blocks:
@@ -244,11 +257,12 @@ class HCGPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    @torch.inference_mode()
     def get_activations(self, input_ids: torch.Tensor) -> List[torch.Tensor]:
         """Get activations at each layer for Amax gain computation."""
         activations = []
         B, S = input_ids.shape
-        positions = torch.arange(0, S, device=input_ids.device)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(positions))
         x = expand_to_mhc(x, self.expansion_rate)
         activations.append(x.detach())
@@ -263,20 +277,21 @@ class mHCGPT(nn.Module):
 
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int,
                  num_heads: int, expansion_rate: int = 4, max_seq_len: int = 512,
-                 dropout: float = 0.1, sinkhorn_iters: int = 10):
+                 dropout: float = 0.1, sinkhorn_iters: int = 20):  # Paper: t_max=20
         super().__init__()
         self.expansion_rate = expansion_rate
         self.tok_emb = nn.Embedding(vocab_size, hidden_dim)
         self.pos_emb = nn.Embedding(max_seq_len, hidden_dim)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList([
-            mHCBlock(hidden_dim, num_heads, expansion_rate, dropout, max_seq_len, sinkhorn_iters)
+            mHCBlock(hidden_dim, num_heads, expansion_rate, dropout, sinkhorn_iters)
             for _ in range(num_layers)
         ])
         self.ln_f = nn.LayerNorm(hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight
         self.apply(self._init_weights)
+        # Weight tying (after init so embedding init is used)
+        self.lm_head.weight = self.tok_emb.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -286,7 +301,7 @@ class mHCGPT(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, targets: Optional[torch.Tensor] = None):
         B, S = input_ids.shape
-        positions = torch.arange(0, S, device=input_ids.device)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(positions))
         x = expand_to_mhc(x, self.expansion_rate)
         for block in self.blocks:
@@ -299,11 +314,12 @@ class mHCGPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    @torch.inference_mode()
     def get_activations(self, input_ids: torch.Tensor) -> List[torch.Tensor]:
         """Get activations at each layer for Amax gain computation."""
         activations = []
         B, S = input_ids.shape
-        positions = torch.arange(0, S, device=input_ids.device)
+        positions = torch.arange(0, S, dtype=torch.long, device=input_ids.device)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(positions))
         x = expand_to_mhc(x, self.expansion_rate)
         activations.append(x.detach())
@@ -346,8 +362,6 @@ def get_wikitext2_data():
 
     Source: https://huggingface.co/datasets/Salesforce/wikitext
     """
-    import os
-
     cache_file = "data/wikitext2.txt"
     os.makedirs("data", exist_ok=True)
 
@@ -385,9 +399,8 @@ def get_wikitext2_data():
 
 
 def get_tinyshakespeare_data():
-    """Download TinyShakespeare as fallback."""
+    """Download TinyShakespeare dataset."""
     import urllib.request
-    import os
 
     cache_file = "data/tiny_shakespeare.txt"
     os.makedirs("data", exist_ok=True)
@@ -396,14 +409,17 @@ def get_tinyshakespeare_data():
         with open(cache_file, 'r') as f:
             return f.read()
 
+    print("Downloading TinyShakespeare dataset...")
     url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
     try:
         with urllib.request.urlopen(url) as response:
             text = response.read().decode('utf-8')
         with open(cache_file, 'w') as f:
             f.write(text)
+        print(f"Downloaded TinyShakespeare: {len(text):,} characters")
         return text
-    except:
+    except Exception as e:
+        print(f"Warning: Failed to download TinyShakespeare ({e}), using fallback text")
         return "The quick brown fox jumps over the lazy dog. " * 10000
 
 
@@ -416,8 +432,6 @@ def get_wikitext103_data():
 
     Source: https://huggingface.co/datasets/Salesforce/wikitext
     """
-    import os
-
     cache_file = "data/wikitext103.txt"
     os.makedirs("data", exist_ok=True)
 
@@ -464,7 +478,6 @@ def get_enwik8_data():
 
     Source: https://mattmahoney.net/dc/textdata.html
     """
-    import os
     import urllib.request
     import zipfile
     import io
@@ -505,7 +518,6 @@ def get_enwik9_data():
 
     Source: https://mattmahoney.net/dc/textdata.html
     """
-    import os
     import urllib.request
     import zipfile
     import io
@@ -539,7 +551,7 @@ def get_enwik9_data():
         raise RuntimeError(f"Failed to download enwik9: {e}")
 
 
-def get_training_data(dataset: str = "wikitext2"):
+def get_training_data(dataset: str = "wikitext2") -> str:
     """Get training data from specified dataset."""
     if dataset == "wikitext2":
         return get_wikitext2_data()
@@ -549,8 +561,10 @@ def get_training_data(dataset: str = "wikitext2"):
         return get_enwik8_data()
     elif dataset == "enwik9":
         return get_enwik9_data()
-    else:
+    elif dataset == "shakespeare":
         return get_tinyshakespeare_data()
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}. Choose from: wikitext2, wikitext103, enwik8, enwik9, shakespeare")
 
 
 # =============================================================================
@@ -627,14 +641,17 @@ def get_lr_scheduler(optimizer, config: TrainConfig):
     We implement warmup + cosine decay for simplicity and comparable behavior.
     """
     warmup_steps = int(config.max_iters * config.warmup_ratio)
+    decay_steps = config.max_iters - warmup_steps
 
     def lr_lambda(step):
         if step < warmup_steps:
             # Linear warmup
-            return (step + 1) / warmup_steps
+            return (step + 1) / max(warmup_steps, 1)
+        elif decay_steps == 0:
+            return config.lr_decay_ratio
         else:
             # Cosine decay to lr_decay_ratio of initial LR
-            progress = (step - warmup_steps) / (config.max_iters - warmup_steps)
+            progress = (step - warmup_steps) / decay_steps
             cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
             # Decay from 1.0 to lr_decay_ratio
             return config.lr_decay_ratio + (1 - config.lr_decay_ratio) * cosine_decay
@@ -708,10 +725,9 @@ def train_model(
         optimizer.step()
         scheduler.step()
 
-        # Compute Amax gain
-        with torch.no_grad():
-            activations = model.get_activations(x)
-            amax_gain = compute_amax_gain(activations)
+        # Compute Amax gain (get_activations already uses inference_mode)
+        activations = model.get_activations(x)
+        amax_gain = compute_amax_gain(activations)
 
         # Log metrics
         if step % config.log_interval == 0:
@@ -847,8 +863,8 @@ def plot_detailed_comparison(results: Dict[str, Dict[str, List[float]]], save_pa
     max_loss = max(final_loss) if max(final_loss) > 0 else 1
     max_amax = max(final_amax) if max(final_amax) > 0 else 1
 
-    bars1 = ax4.bar(x - width, [l/max_loss for l in final_loss], width, label='Final Loss (norm)', color='#3498db')
-    bars2 = ax4.bar(x, [np.log10(a+1)/np.log10(max_amax+1) for a in final_amax], width, label='Amax Gain (norm log)', color='#e74c3c')
+    ax4.bar(x - width, [l/max_loss for l in final_loss], width, label='Final Loss (norm)', color='#3498db')
+    ax4.bar(x, [np.log10(a+1)/np.log10(max_amax+1) for a in final_amax], width, label='Amax Gain (norm log)', color='#e74c3c')
 
     ax4.set_ylabel('Normalized Value')
     ax4.set_title('Final Metrics Comparison')
@@ -868,11 +884,16 @@ def plot_detailed_comparison(results: Dict[str, Dict[str, List[float]]], save_pa
 # Main Experiment
 # =============================================================================
 
-def run_experiment(config: Optional[TrainConfig] = None):
+def run_experiment(config: Optional[TrainConfig] = None, seed: int = 42):
     """Run the full training stability experiment."""
 
     if config is None:
         config = TrainConfig()
+
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     print("=" * 60)
     print("Training Stability Experiment: Baseline vs HC vs mHC")
@@ -947,7 +968,6 @@ def run_experiment(config: Optional[TrainConfig] = None):
     print("Generating plots...")
     print("=" * 60)
 
-    import os
     os.makedirs("images", exist_ok=True)
 
     plot_results(results, "images/training_stability.png")
@@ -996,6 +1016,7 @@ if __name__ == "__main__":
                         choices=["wikitext2", "wikitext103", "enwik8", "enwik9", "shakespeare"],
                         help="Dataset: wikitext2 (~2MB), wikitext103 (~500MB), enwik8 (100MB), enwik9 (1GB), shakespeare (~1MB)")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -1017,4 +1038,4 @@ if __name__ == "__main__":
     # Store dataset choice in config
     config.dataset = args.dataset
 
-    run_experiment(config)
+    run_experiment(config, seed=args.seed)
