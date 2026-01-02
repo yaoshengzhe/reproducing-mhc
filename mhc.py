@@ -7,11 +7,11 @@ This module implements:
 2. Manifold-Constrained Hyper-Connections (mHC) from arXiv:2512.24880
 
 Key equations:
-- HC: x_{l+1} = H_post * (F(H_pre * x_l) + H_res * H_pre * x_l)
+- HC: x_{l+1} = H_res * x_l + H_post^T * F(H_pre * x_l)
 - mHC adds manifold constraints:
-  - H_res -> doubly stochastic via Sinkhorn-Knopp (spectral norm <= 1)
-  - H_pre -> non-negative via sigmoid, values in [0, 1]
-  - H_post -> doubly stochastic via Sinkhorn-Knopp (spectral norm <= 1)
+  - H_res (n x n) -> doubly stochastic via Sinkhorn-Knopp (spectral norm <= 1)
+  - H_pre (1 x n) -> probability simplex via softmax (aggregates n copies to 1)
+  - H_post (n x 1) -> non-negative via softmax (expands 1 to n copies)
 """
 
 import torch
@@ -59,12 +59,12 @@ class HyperConnection(nn.Module):
     and allowing learnable connectivity patterns between layers.
 
     The HC equation:
-        x_{l+1} = H_post * (F(H_pre * x) + H_res * H_pre * x)
+        x_{l+1} = H_res * x + H_post^T * F(H_pre * x)
 
     where:
-        - H_pre: Pre-connection matrix (n x n), mixes n copies before layer
-        - H_res: Residual connection matrix (n x n), controls skip connection
-        - H_post: Post-connection matrix (n x n), mixes after layer output
+        - H_pre: Pre-connection vector (1 x n), aggregates n copies into 1 for layer
+        - H_res: Residual connection matrix (n x n), mixes features in residual stream
+        - H_post: Post-connection vector (n x 1), expands layer output back to n copies
         - n: Expansion rate (number of copies of the residual stream)
 
     Args:
@@ -77,24 +77,24 @@ class HyperConnection(nn.Module):
         self.n = expansion_rate
         self.d = hidden_dim
 
-        # Learnable connection matrices
-        # H_pre: selects/mixes which copy to use as layer input
-        self.H_pre = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
-        # H_res: residual connection weights
+        # Learnable connection matrices/vectors
+        # H_pre: (1, n) aggregates n copies into 1 for layer input
+        self.H_pre = nn.Parameter(torch.zeros(1, expansion_rate))
+        # H_res: (n, n) residual connection mixing matrix
         self.H_res = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
-        # H_post: mixes layer output back to expanded stream
-        self.H_post = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
+        # H_post: (n, 1) expands layer output back to n copies
+        self.H_post = nn.Parameter(torch.zeros(expansion_rate, 1))
 
         self._init_weights()
 
     def _init_weights(self):
         """Initialize to approximate identity/Pre-Norm behavior."""
-        # Initialize H_pre to select first copy (standard behavior)
-        nn.init.eye_(self.H_pre)
+        # Initialize H_pre to uniform aggregation (1/n for each copy)
+        nn.init.constant_(self.H_pre, 1.0 / self.n)
         # Initialize H_res to identity (standard residual)
         nn.init.eye_(self.H_res)
-        # Initialize H_post to identity
-        nn.init.eye_(self.H_post)
+        # Initialize H_post to uniform expansion
+        nn.init.constant_(self.H_post, 1.0)
 
     def forward(
         self,
@@ -116,28 +116,24 @@ class HyperConnection(nn.Module):
         B, S, n, d = x.shape
         assert n == self.n, f"Expected expansion rate {self.n}, got {n}"
 
-        # H_pre * x: mix copies before layer
-        # (n, n) @ (B, S, n, d) -> contract on second-to-last dim
-        x_pre = torch.einsum('ij,bsjd->bsid', self.H_pre, x)
+        # Residual path: H_res @ x
+        # H_res: (n, n), x: (B, S, n, d) -> (B, S, n, d)
+        x_res = torch.einsum('ij,bsjd->bsid', self.H_res, x)
 
-        # Compute weighted input for layer (mean across copies to prevent explosion)
-        layer_input = x_pre.mean(dim=2)  # (B, S, d)
+        # H_pre @ x: aggregate n copies into 1 for layer input
+        # H_pre: (1, n), x: (B, S, n, d) -> (B, S, 1, d) -> squeeze to (B, S, d)
+        layer_input = torch.einsum('kj,bsjd->bskd', self.H_pre, x).squeeze(2)
 
         # Apply the layer function
         layer_output = layer_fn(layer_input)  # (B, S, d)
 
-        # Expand back to n copies
-        layer_output = layer_output.unsqueeze(2).expand(-1, -1, n, -1)
+        # H_post^T @ layer_output: expand layer output back to n copies
+        # H_post: (n, 1), layer_output: (B, S, d) -> (B, S, n, d)
+        # Each copy i is scaled by H_post[i, 0]
+        post_out = torch.einsum('i,bsd->bsid', self.H_post.squeeze(-1), layer_output)
 
-        # H_res * H_pre * x: residual path
-        # Per paper equation: x_{l+1} = H_post * (F(H_pre * x) + H_res * H_pre * x)
-        x_res = torch.einsum('ij,bsjd->bsid', self.H_res, x_pre)
-
-        # Combine layer output with residual, scaled to prevent magnitude growth
-        combined = 0.5 * (layer_output + x_res)
-
-        # H_post: mix after combination
-        output = torch.einsum('ij,bsjd->bsid', self.H_post, combined)
+        # x_{l+1} = H_res @ x + H_post^T @ F(H_pre @ x)
+        output = x_res + post_out
 
         return output
 
@@ -146,14 +142,16 @@ class mHC(nn.Module):
     """
     Manifold-Constrained Hyper-Connection (mHC) module from arXiv:2512.24880.
 
+    The mHC equation:
+        x_{l+1} = H_res * x + H_post^T * F(H_pre * x)
+
     mHC addresses HC's training instability by projecting connection matrices
     onto specific manifolds that preserve the identity mapping property:
 
-    - H_res: Projected onto doubly stochastic manifold via Sinkhorn-Knopp
+    - H_res: (n x n) Projected onto doubly stochastic manifold via Sinkhorn-Knopp
             This ensures spectral norm ||H_res|| <= 1, preventing signal explosion
-    - H_pre: Non-negative via sigmoid, σ(H̃_pre + b_pre)
-    - H_post: Projected onto doubly stochastic manifold via Sinkhorn-Knopp
-            This ensures spectral norm ||H_post|| <= 1 for bounded output
+    - H_pre: (1 x n) Non-negative via softmax, aggregates n copies into 1
+    - H_post: (n x 1) Non-negative via softmax, expands layer output to n copies
 
     These constraints guarantee:
     1. Bounded signal propagation across layers
@@ -179,47 +177,37 @@ class mHC(nn.Module):
 
         # Learnable parameters (in unconstrained space)
         # These will be projected onto manifolds during forward pass
-        self.H_pre_raw = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
+        # H_pre: (1, n) aggregates n copies into 1
+        self.H_pre_raw = nn.Parameter(torch.zeros(1, expansion_rate))
+        # H_res: (n, n) residual mixing matrix
         self.H_res_raw = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
-        self.H_post_raw = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
-
-        # Bias term for H_pre (sigmoid projection)
-        self.b_pre = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
+        # H_post: (n, 1) expands layer output to n copies
+        self.H_post_raw = nn.Parameter(torch.zeros(expansion_rate, 1))
 
         self._init_weights()
 
     def _init_weights(self):
         """Initialize to approximate identity mapping."""
-        # Initialize raw parameters to produce near-identity after projection
-        # For H_res and H_post (doubly stochastic): start with uniform to get 1/n matrix
+        # Initialize raw parameters to produce uniform after softmax/sinkhorn
+        nn.init.zeros_(self.H_pre_raw)
         nn.init.zeros_(self.H_res_raw)
         nn.init.zeros_(self.H_post_raw)
 
-        # For H_pre: initialize bias to produce near-identity via sigmoid
-        # sigmoid(0 + b) = 0.5 for b=0, need sigmoid^-1(1) for diagonal
-        nn.init.zeros_(self.H_pre_raw)
-
-        # Initialize bias so that diagonal elements are stronger
-        with torch.no_grad():
-            eye = torch.eye(self.n)
-            # sigmoid(2) ≈ 0.88, sigmoid(-2) ≈ 0.12
-            self.b_pre.copy_(eye * 2.0 - (1 - eye) * 2.0)
-
     def get_H_pre(self) -> torch.Tensor:
-        """Get H_pre projected onto non-negative manifold via sigmoid."""
-        return torch.sigmoid(self.H_pre_raw + self.b_pre)
+        """Get H_pre projected onto probability simplex via softmax."""
+        # H_pre: (1, n) -> softmax over n dimension ensures sum to 1
+        return F.softmax(self.H_pre_raw, dim=-1)
 
     def get_H_res(self) -> torch.Tensor:
         """Get H_res projected onto doubly stochastic manifold via Sinkhorn-Knopp."""
         return sinkhorn_knopp(self.H_res_raw, num_iters=self.sinkhorn_iters)
 
     def get_H_post(self) -> torch.Tensor:
-        """Get H_post projected onto doubly stochastic manifold via Sinkhorn-Knopp.
+        """Get H_post projected onto non-negative manifold via softmax.
 
-        Making H_post doubly stochastic (like H_res) ensures spectral norm <= 1,
-        which bounds overall signal propagation through the network.
+        H_post: (n, 1) -> softmax over n dimension ensures non-negative weights.
         """
-        return sinkhorn_knopp(self.H_post_raw, num_iters=self.sinkhorn_iters)
+        return F.softmax(self.H_post_raw, dim=0)
 
     def forward(
         self,
@@ -238,37 +226,32 @@ class mHC(nn.Module):
             Output tensor of same shape as input
         """
         # Get manifold-constrained matrices
-        H_pre = self.get_H_pre()    # Non-negative
-        H_res = self.get_H_res()    # Doubly stochastic
-        H_post = self.get_H_post()  # Non-negative, scaled
+        H_pre = self.get_H_pre()    # (1, n) softmax
+        H_res = self.get_H_res()    # (n, n) doubly stochastic
+        H_post = self.get_H_post()  # (n, 1) softmax
 
         # x shape: (B, S, n, d)
         B, S, n, d = x.shape
         assert n == self.n, f"Expected expansion rate {self.n}, got {n}"
 
-        # H_pre * x: mix copies before layer
-        x_pre = torch.einsum('ij,bsjd->bsid', H_pre, x)
+        # Residual path: H_res @ x
+        # H_res: (n, n), x: (B, S, n, d) -> (B, S, n, d)
+        x_res = torch.einsum('ij,bsjd->bsid', H_res, x)
 
-        # Compute weighted input for layer (mean across copies to maintain magnitude)
-        # Using mean instead of sum prevents signal amplification
-        layer_input = x_pre.mean(dim=2)  # (B, S, d)
+        # H_pre @ x: aggregate n copies into 1 for layer input
+        # H_pre: (1, n), x: (B, S, n, d) -> (B, S, 1, d) -> squeeze to (B, S, d)
+        layer_input = torch.einsum('kj,bsjd->bskd', H_pre, x).squeeze(2)
 
         # Apply the layer function
         layer_output = layer_fn(layer_input)  # (B, S, d)
 
-        # Expand back to n copies (each copy gets the layer output)
-        layer_output = layer_output.unsqueeze(2).expand(-1, -1, n, -1)
+        # H_post^T @ layer_output: expand layer output back to n copies
+        # H_post: (n, 1), layer_output: (B, S, d) -> (B, S, n, d)
+        # Each copy i is scaled by H_post[i, 0]
+        post_out = torch.einsum('i,bsd->bsid', H_post.squeeze(-1), layer_output)
 
-        # H_res * H_pre * x: residual path through doubly stochastic matrix
-        # Per paper equation: x_{l+1} = H_post * (F(H_pre * x) + H_res * H_pre * x)
-        x_res = torch.einsum('ij,bsjd->bsid', H_res, x_pre)
-
-        # Combine layer output with residual, scaled to prevent magnitude growth
-        # Using 0.5 scaling (average) instead of sum to bound signal propagation
-        combined = 0.5 * (layer_output + x_res)
-
-        # H_post: mix after combination (doubly stochastic preserves L1 norm)
-        output = torch.einsum('ij,bsjd->bsid', H_post, combined)
+        # x_{l+1} = H_res @ x + H_post^T @ F(H_pre @ x)
+        output = x_res + post_out
 
         return output
 
@@ -437,11 +420,14 @@ if __name__ == "__main__":
 
     # Check manifold constraints
     H_pre, H_res, H_post = mhc_module.get_matrices()
+    print(f"   H_pre shape: {H_pre.shape} (1 x n)")
+    print(f"   H_res shape: {H_res.shape} (n x n)")
+    print(f"   H_post shape: {H_post.shape} (n x 1)")
     print(f"   H_res doubly stochastic check:")
     print(f"     Row sums: {H_res.sum(dim=-1)}")
     print(f"     Col sums: {H_res.sum(dim=-2)}")
-    print(f"   H_pre non-negative: {(H_pre >= 0).all()}")
-    print(f"   H_post non-negative: {(H_post >= 0).all()}")
+    print(f"   H_pre sum (softmax): {H_pre.sum():.4f}")
+    print(f"   H_post sum (softmax): {H_post.sum():.4f}")
 
     # Test mHCBlock
     print("\n4. Testing mHCBlock...")
