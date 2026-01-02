@@ -336,49 +336,87 @@ class TextDataset(torch.utils.data.Dataset):
         return x, y
 
 
-def get_training_data():
+def get_wikitext2_data():
     """
-    Download and return TinyShakespeare dataset.
+    Download and return WikiText-2 dataset.
 
-    This is a ~1MB dataset of Shakespeare's complete works,
-    much more challenging than simple repeated sentences.
-    Source: https://github.com/karpathy/char-rnn
+    WikiText-2 is a more challenging dataset (~2MB) extracted from
+    Wikipedia Good and Featured articles. More diverse vocabulary
+    and complex patterns than TinyShakespeare.
+
+    Source: https://huggingface.co/datasets/wikitext
     """
     import urllib.request
     import os
+    import zipfile
 
-    cache_file = "tiny_shakespeare.txt"
+    cache_file = "data/wikitext2.txt"
+    os.makedirs("data", exist_ok=True)
 
     if os.path.exists(cache_file):
-        print(f"Loading cached dataset from {cache_file}")
+        print(f"Loading cached WikiText-2 from {cache_file}")
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    url = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip"
+    zip_file = "data/wikitext-2-v1.zip"
+
+    print(f"Downloading WikiText-2 dataset...")
+
+    try:
+        urllib.request.urlretrieve(url, zip_file)
+
+        # Extract
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            zip_ref.extractall("data")
+
+        # Read train file
+        train_file = "data/wikitext-2/wiki.train.tokens"
+        with open(train_file, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        # Cache combined
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        print(f"Downloaded WikiText-2: {len(text):,} characters")
+        return text
+
+    except Exception as e:
+        print(f"Failed to download WikiText-2: {e}")
+        print("Falling back to TinyShakespeare...")
+        return get_tinyshakespeare_data()
+
+
+def get_tinyshakespeare_data():
+    """Download TinyShakespeare as fallback."""
+    import urllib.request
+    import os
+
+    cache_file = "data/tiny_shakespeare.txt"
+    os.makedirs("data", exist_ok=True)
+
+    if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             return f.read()
 
     url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-    print(f"Downloading TinyShakespeare dataset...")
-
     try:
         with urllib.request.urlopen(url) as response:
             text = response.read().decode('utf-8')
-
-        # Cache the dataset
         with open(cache_file, 'w') as f:
             f.write(text)
+        return text
+    except:
+        return "The quick brown fox jumps over the lazy dog. " * 10000
 
-        print(f"Downloaded {len(text):,} characters")
-        return text
-    except Exception as e:
-        print(f"Failed to download dataset: {e}")
-        print("Falling back to simple dataset...")
-        # Fallback to simple data if download fails
-        text = """
-        The quick brown fox jumps over the lazy dog.
-        A journey of a thousand miles begins with a single step.
-        To be or not to be, that is the question.
-        All that glitters is not gold.
-        Knowledge is power and wisdom is strength.
-        """ * 1000
-        return text
+
+def get_training_data(dataset: str = "wikitext2"):
+    """Get training data from specified dataset."""
+    if dataset == "wikitext2":
+        return get_wikitext2_data()
+    else:
+        return get_tinyshakespeare_data()
 
 
 # =============================================================================
@@ -416,16 +454,18 @@ def compute_amax_gain(activations: List[torch.Tensor]) -> float:
 
 @dataclass
 class TrainConfig:
+    """Training configuration matching paper setup where possible."""
     vocab_size: int = 50
-    hidden_dim: int = 128
-    num_layers: int = 6
-    num_heads: int = 4
-    expansion_rate: int = 4
+    hidden_dim: int = 256      # Increased for more challenging experiments
+    num_layers: int = 8        # Deeper network to show stability differences
+    num_heads: int = 8
+    expansion_rate: int = 4    # Matches paper: n=4
     max_seq_len: int = 128
     batch_size: int = 32
-    learning_rate: float = 1e-3
-    max_iters: int = 2000
-    log_interval: int = 50
+    learning_rate: float = 3e-4  # Standard LM learning rate
+    max_iters: int = 1000
+    log_interval: int = 20     # More frequent logging
+    dataset: str = "wikitext2"
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
@@ -665,8 +705,8 @@ def run_experiment(config: Optional[TrainConfig] = None):
     print("=" * 60)
 
     # Create dataset
-    print("\nCreating dataset...")
-    text = get_training_data()
+    print(f"\nLoading {config.dataset} dataset...")
+    text = get_training_data(config.dataset)
     dataset = TextDataset(text, config.max_seq_len)
     train_loader = torch.utils.data.DataLoader(
         dataset, batch_size=config.batch_size, shuffle=True
@@ -720,13 +760,16 @@ def run_experiment(config: Optional[TrainConfig] = None):
     print(f"Parameters: {sum(p.numel() for p in mhc_model.parameters()):,}")
     results['mHC'] = train_model(mhc_model, train_loader, config, "mHC")
 
-    # Generate plots
+    # Generate plots - save to images/ folder
     print("\n" + "=" * 60)
     print("Generating plots...")
     print("=" * 60)
 
-    plot_results(results, "training_stability.png")
-    plot_detailed_comparison(results, "stability_detailed.png")
+    import os
+    os.makedirs("images", exist_ok=True)
+
+    plot_results(results, "images/training_stability.png")
+    plot_detailed_comparison(results, "images/stability_detailed.png")
 
     # Print summary
     print("\n" + "=" * 60)
@@ -757,23 +800,31 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Training Stability Experiment")
-    parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--num_layers", type=int, default=6)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--expansion_rate", type=int, default=4)
-    parser.add_argument("--max_iters", type=int, default=2000)
+    parser.add_argument("--max_iters", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--dataset", type=str, default="wikitext2", choices=["wikitext2", "shakespeare"])
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
     config = TrainConfig(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        num_heads=args.num_heads,
         expansion_rate=args.expansion_rate,
         max_iters=args.max_iters,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate
     )
 
     if args.device:
         config.device = args.device
+
+    # Store dataset choice in config
+    config.dataset = args.dataset
 
     run_experiment(config)
