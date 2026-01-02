@@ -9,9 +9,9 @@ This module implements:
 Key equations:
 - HC: x_{l+1} = H_post * (F(H_pre * x_l) + H_res * H_pre * x_l)
 - mHC adds manifold constraints:
-  - H_res -> doubly stochastic via Sinkhorn-Knopp
-  - H_pre -> non-negative via sigmoid
-  - H_post -> non-negative via scaled sigmoid
+  - H_res -> doubly stochastic via Sinkhorn-Knopp (spectral norm <= 1)
+  - H_pre -> non-negative via sigmoid, values in [0, 1]
+  - H_post -> doubly stochastic via Sinkhorn-Knopp (spectral norm <= 1)
 """
 
 import torch
@@ -129,11 +129,12 @@ class HyperConnection(nn.Module):
         # Expand back to n copies
         layer_output = layer_output.unsqueeze(2).expand(-1, -1, n, -1)
 
-        # H_res * x: residual path (apply to original x for proper residual)
-        x_res = torch.einsum('ij,bsjd->bsid', self.H_res, x)
+        # H_res * H_pre * x: residual path
+        # Per paper equation: x_{l+1} = H_post * (F(H_pre * x) + H_res * H_pre * x)
+        x_res = torch.einsum('ij,bsjd->bsid', self.H_res, x_pre)
 
-        # Combine layer output with residual
-        combined = layer_output + x_res
+        # Combine layer output with residual, scaled to prevent magnitude growth
+        combined = 0.5 * (layer_output + x_res)
 
         # H_post: mix after combination
         output = torch.einsum('ij,bsjd->bsid', self.H_post, combined)
@@ -151,7 +152,8 @@ class mHC(nn.Module):
     - H_res: Projected onto doubly stochastic manifold via Sinkhorn-Knopp
             This ensures spectral norm ||H_res|| <= 1, preventing signal explosion
     - H_pre: Non-negative via sigmoid, σ(H̃_pre + b_pre)
-    - H_post: Non-negative via scaled sigmoid, 2*σ(H̃_post + b_post)
+    - H_post: Projected onto doubly stochastic manifold via Sinkhorn-Knopp
+            This ensures spectral norm ||H_post|| <= 1 for bounded output
 
     These constraints guarantee:
     1. Bounded signal propagation across layers
@@ -181,30 +183,27 @@ class mHC(nn.Module):
         self.H_res_raw = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
         self.H_post_raw = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
 
-        # Bias terms for pre and post (as mentioned in paper)
+        # Bias term for H_pre (sigmoid projection)
         self.b_pre = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
-        self.b_post = nn.Parameter(torch.zeros(expansion_rate, expansion_rate))
 
         self._init_weights()
 
     def _init_weights(self):
         """Initialize to approximate identity mapping."""
         # Initialize raw parameters to produce near-identity after projection
-        # For H_res (doubly stochastic): start with uniform to get 1/n matrix
+        # For H_res and H_post (doubly stochastic): start with uniform to get 1/n matrix
         nn.init.zeros_(self.H_res_raw)
-
-        # For H_pre and H_post: initialize biases to produce near-identity
-        # sigmoid(0 + b) = 0.5 for b=0, need sigmoid^-1(1) for diagonal
-        # Use identity-like initialization
-        nn.init.zeros_(self.H_pre_raw)
         nn.init.zeros_(self.H_post_raw)
 
-        # Initialize biases so that diagonal elements are stronger
+        # For H_pre: initialize bias to produce near-identity via sigmoid
+        # sigmoid(0 + b) = 0.5 for b=0, need sigmoid^-1(1) for diagonal
+        nn.init.zeros_(self.H_pre_raw)
+
+        # Initialize bias so that diagonal elements are stronger
         with torch.no_grad():
             eye = torch.eye(self.n)
             # sigmoid(2) ≈ 0.88, sigmoid(-2) ≈ 0.12
             self.b_pre.copy_(eye * 2.0 - (1 - eye) * 2.0)
-            self.b_post.copy_(eye * 2.0 - (1 - eye) * 2.0)
 
     def get_H_pre(self) -> torch.Tensor:
         """Get H_pre projected onto non-negative manifold via sigmoid."""
@@ -215,8 +214,12 @@ class mHC(nn.Module):
         return sinkhorn_knopp(self.H_res_raw, num_iters=self.sinkhorn_iters)
 
     def get_H_post(self) -> torch.Tensor:
-        """Get H_post projected onto non-negative manifold via scaled sigmoid."""
-        return 2.0 * torch.sigmoid(self.H_post_raw + self.b_post)
+        """Get H_post projected onto doubly stochastic manifold via Sinkhorn-Knopp.
+
+        Making H_post doubly stochastic (like H_res) ensures spectral norm <= 1,
+        which bounds overall signal propagation through the network.
+        """
+        return sinkhorn_knopp(self.H_post_raw, num_iters=self.sinkhorn_iters)
 
     def forward(
         self,
@@ -256,19 +259,16 @@ class mHC(nn.Module):
         # Expand back to n copies (each copy gets the layer output)
         layer_output = layer_output.unsqueeze(2).expand(-1, -1, n, -1)
 
-        # H_res * x: residual path through doubly stochastic matrix
-        # Apply H_res directly to original x for proper residual connection
-        x_res = torch.einsum('ij,bsjd->bsid', H_res, x)
+        # H_res * H_pre * x: residual path through doubly stochastic matrix
+        # Per paper equation: x_{l+1} = H_post * (F(H_pre * x) + H_res * H_pre * x)
+        x_res = torch.einsum('ij,bsjd->bsid', H_res, x_pre)
 
-        # Combine layer output with residual
-        combined = layer_output + x_res
+        # Combine layer output with residual, scaled to prevent magnitude growth
+        # Using 0.5 scaling (average) instead of sum to bound signal propagation
+        combined = 0.5 * (layer_output + x_res)
 
-        # H_post: mix after combination, normalize by sum to bound output
+        # H_post: mix after combination (doubly stochastic preserves L1 norm)
         output = torch.einsum('ij,bsjd->bsid', H_post, combined)
-        # Normalize by row sums of H_post to prevent unbounded growth
-        # H_post.sum(dim=-1) gives (n,), need to reshape to (1, 1, n, 1) for broadcasting
-        h_post_row_sums = H_post.sum(dim=-1).view(1, 1, -1, 1)
-        output = output / (h_post_row_sums + 1e-8)
 
         return output
 
@@ -331,10 +331,14 @@ class mHCBlock(nn.Module):
         self.mhc_attn = mHC(expansion_rate, hidden_dim, sinkhorn_iters)
         self.mhc_ffn = mHC(expansion_rate, hidden_dim, sinkhorn_iters)
 
-    def _attn_fn(self, x: torch.Tensor) -> torch.Tensor:
+    def _attn_fn(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Self-attention with pre-norm."""
         x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
+        attn_out, _ = self.attn(
+            x_norm, x_norm, x_norm,
+            attn_mask=attn_mask,
+            need_weights=False
+        )
         return attn_out
 
     def _ffn_fn(self, x: torch.Tensor) -> torch.Tensor:
@@ -356,8 +360,8 @@ class mHCBlock(nn.Module):
         Returns:
             Output tensor of same shape as input
         """
-        # Apply mHC around attention
-        x = self.mhc_attn(x, self._attn_fn)
+        # Apply mHC around attention (pass mask via lambda)
+        x = self.mhc_attn(x, lambda h: self._attn_fn(h, attn_mask))
 
         # Apply mHC around FFN
         x = self.mhc_ffn(x, self._ffn_fn)
@@ -386,7 +390,8 @@ def contract_from_mhc(x: torch.Tensor) -> torch.Tensor:
     """
     Contract mHC tensor back to standard format.
 
-    Takes (B, S, n, D) tensor and sums across expansion dimension.
+    Takes (B, S, n, D) tensor and averages across expansion dimension
+    to preserve signal magnitude.
 
     Args:
         x: Input tensor of shape (batch, seq_len, n, hidden_dim)
@@ -394,7 +399,7 @@ def contract_from_mhc(x: torch.Tensor) -> torch.Tensor:
     Returns:
         Contracted tensor of shape (batch, seq_len, hidden_dim)
     """
-    return x.sum(dim=2)
+    return x.mean(dim=2)
 
 
 if __name__ == "__main__":

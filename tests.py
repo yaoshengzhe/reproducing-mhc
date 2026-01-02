@@ -80,9 +80,12 @@ def test_mhc_constraints():
         assert (H_pre >= 0).all(), "H_pre has negative entries"
         assert (H_pre <= 1).all(), "H_pre exceeds sigmoid range"
 
-        # H_post should be non-negative and scaled
+        # H_post should be doubly stochastic (like H_res)
+        assert torch.allclose(H_post.sum(dim=-1), torch.ones(n), atol=1e-5), \
+            f"H_post row sums incorrect for n={n}"
+        assert torch.allclose(H_post.sum(dim=-2), torch.ones(n), atol=1e-5), \
+            f"H_post col sums incorrect for n={n}"
         assert (H_post >= 0).all(), "H_post has negative entries"
-        assert (H_post <= 2).all(), "H_post exceeds scaled sigmoid range"
 
     print("  PASSED")
 
@@ -290,8 +293,8 @@ def test_expand_contract():
     contracted = contract_from_mhc(expanded)
     assert contracted.shape == (2, 16, 64), f"Wrong contracted shape: {contracted.shape}"
 
-    # Contracted should be n * original (sum of n identical copies)
-    assert torch.allclose(contracted, n * x), "Contract doesn't sum correctly"
+    # Contracted should equal original (mean of n identical copies)
+    assert torch.allclose(contracted, x), "Contract doesn't average correctly"
 
     print("  PASSED")
 
