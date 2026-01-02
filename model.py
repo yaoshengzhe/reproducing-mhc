@@ -5,7 +5,6 @@ This implements a decoder-only transformer architecture enhanced with mHC
 for improved training stability and scalability.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,15 +15,15 @@ from mhc import mHC, expand_to_mhc, contract_from_mhc
 
 class CausalSelfAttention(nn.Module):
     """
-    Causal self-attention with rotary positional embeddings option.
+    Causal self-attention using PyTorch's scaled_dot_product_attention.
+    Automatically uses Flash Attention when available.
     """
 
     def __init__(
         self,
         hidden_dim: int,
         num_heads: int,
-        dropout: float = 0.1,
-        max_seq_len: int = 1024
+        dropout: float = 0.1
     ):
         super().__init__()
         assert hidden_dim % num_heads == 0
@@ -38,15 +37,7 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
         # Output projection
         self.proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
-
-        self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
-
-        # Causal mask
-        self.register_buffer(
-            "causal_mask",
-            torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len)
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, D = x.shape
@@ -60,18 +51,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        # Apply causal mask
-        attn = attn.masked_fill(self.causal_mask[:, :, :S, :S] == 0, float('-inf'))
-
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)
+        # Scaled dot-product attention with causal mask
+        # Uses Flash Attention automatically when available
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True
+        )
 
         # Reshape back
         out = out.transpose(1, 2).contiguous().view(B, S, D)
@@ -100,7 +87,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.gelu(self.fc1(x))
-        x = self.dropout(x)
         x = self.fc2(x)
         x = self.dropout(x)
         return x
@@ -123,7 +109,7 @@ class mHCTransformerBlock(nn.Module):
         ffn_ratio: int = 4,
         dropout: float = 0.1,
         max_seq_len: int = 1024,
-        sinkhorn_iters: int = 10
+        sinkhorn_iters: int = 20  # Paper: t_max = 20
     ):
         super().__init__()
         self.expansion_rate = expansion_rate
@@ -133,12 +119,20 @@ class mHCTransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
 
         # Core modules
-        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout, max_seq_len)
+        self.attn = CausalSelfAttention(hidden_dim, num_heads, dropout)
         self.ffn = FeedForward(hidden_dim, ffn_ratio, dropout)
 
         # mHC modules
         self.mhc_attn = mHC(expansion_rate, hidden_dim, sinkhorn_iters)
         self.mhc_ffn = mHC(expansion_rate, hidden_dim, sinkhorn_iters)
+
+    def _attn_fn(self, h: torch.Tensor) -> torch.Tensor:
+        """Pre-norm attention."""
+        return self.attn(self.norm1(h))
+
+    def _ffn_fn(self, h: torch.Tensor) -> torch.Tensor:
+        """Pre-norm FFN."""
+        return self.ffn(self.norm2(h))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -148,18 +142,8 @@ class mHCTransformerBlock(nn.Module):
         Returns:
             Output of shape (B, S, n, D)
         """
-        # mHC around attention
-        def attn_fn(h):
-            return self.attn(self.norm1(h))
-
-        x = self.mhc_attn(x, attn_fn)
-
-        # mHC around FFN
-        def ffn_fn(h):
-            return self.ffn(self.norm2(h))
-
-        x = self.mhc_ffn(x, ffn_fn)
-
+        x = self.mhc_attn(x, self._attn_fn)
+        x = self.mhc_ffn(x, self._ffn_fn)
         return x
 
 
@@ -196,7 +180,7 @@ class mHCGPT(nn.Module):
         ffn_ratio: int = 4,
         max_seq_len: int = 1024,
         dropout: float = 0.1,
-        sinkhorn_iters: int = 10
+        sinkhorn_iters: int = 20  # Paper: t_max = 20
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -227,12 +211,14 @@ class mHCGPT(nn.Module):
         # Final layer norm
         self.ln_f = nn.LayerNorm(hidden_dim)
 
-        # Output projection (weight tying with embedding)
+        # Output projection
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight  # Weight tying
 
         # Initialize weights
         self.apply(self._init_weights)
+
+        # Weight tying (after init so embedding init is used)
+        self.lm_head.weight = self.tok_emb.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -294,6 +280,7 @@ class mHCGPT(nn.Module):
 
         return logits, loss
 
+    @torch.inference_mode()
     def generate(
         self,
         input_ids: torch.Tensor,
