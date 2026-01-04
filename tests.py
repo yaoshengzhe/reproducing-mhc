@@ -76,9 +76,11 @@ def test_mhc_constraints():
             f"H_res col sums incorrect for n={n}"
         assert (H_res >= 0).all(), "H_res has negative entries"
 
-        # H_pre should be non-negative (via sigmoid)
+        # H_pre (1, n) should be non-negative with sum = 1 (via softmax)
+        # This ensures valid weighted aggregation of n copies
+        assert torch.allclose(H_pre.sum(), torch.ones(1), atol=1e-5), \
+            f"H_pre sum incorrect for n={n}: {H_pre.sum()}"
         assert (H_pre >= 0).all(), "H_pre has negative entries"
-        assert (H_pre <= 1).all(), "H_pre exceeds sigmoid range"
 
         # H_post (n, 1) should be non-negative with sum = 1 (via softmax)
         # This ensures valid weighted expansion back to n copies
