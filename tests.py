@@ -80,11 +80,10 @@ def test_mhc_constraints():
         assert (H_pre >= 0).all(), "H_pre has negative entries"
         assert (H_pre <= 1).all(), "H_pre exceeds sigmoid range"
 
-        # H_post should be doubly stochastic (like H_res)
-        assert torch.allclose(H_post.sum(dim=-1), torch.ones(n), atol=1e-5), \
-            f"H_post row sums incorrect for n={n}"
-        assert torch.allclose(H_post.sum(dim=-2), torch.ones(n), atol=1e-5), \
-            f"H_post col sums incorrect for n={n}"
+        # H_post (n, 1) should be non-negative with sum = 1 (via softmax)
+        # This ensures valid weighted expansion back to n copies
+        assert torch.allclose(H_post.sum(), torch.ones(1), atol=1e-5), \
+            f"H_post sum incorrect for n={n}: {H_post.sum()}"
         assert (H_post >= 0).all(), "H_post has negative entries"
 
     print("  PASSED")
